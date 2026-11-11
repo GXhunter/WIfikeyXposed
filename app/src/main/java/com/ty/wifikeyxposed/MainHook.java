@@ -157,8 +157,17 @@ public class MainHook extends XposedModule {
             log(4, TAG, "hookBottomNavigation 完成");
             hookFloatingBall(classLoader);
             log(4, TAG, "hookFloatingBall 完成");
+            hookFullscreenGuide(classLoader);
+            log(4, TAG, "hookFullscreenGuide 完成");
+            hookAppUpdate(classLoader);
+            log(4, TAG, "hookAppUpdate 完成");
             hookHomeWidgets(classLoader);
+            hookWifiMapRow(classLoader);
             log(4, TAG, "hookHomeWidgets 完成");
+            hookHomeRootWatcher(classLoader);
+            log(4, TAG, "hookHomeRootWatcher 完成");
+            hookRnHomeView(classLoader);
+            log(4, TAG, "hookRnHomeView 完成");
             // hookHomeDialogComponents 暂时禁用 — S1 hook 导致 NPE 崩溃
             // TODO: 需要分析 S1 返回值类型后再启用
             // hookHomeDialogComponents(classLoader);
@@ -180,6 +189,7 @@ public class MainHook extends XposedModule {
             hookMeFragment(classLoader);
             log(4, TAG, "hookMeFragment 完成");
             log(4, TAG, "=== hook 初始化完成 ===");
+            scheduleStartupHomeHides();
         } catch (Throwable e) {
             log(6, TAG, "Initialization error: " + e.getMessage());
         }
@@ -195,11 +205,17 @@ public class MainHook extends XposedModule {
             if (mainHandler != null) {
                 mainHandler.removeCallbacksAndMessages(null);
             }
+            removeHomeWatch();
             isPerformingForcedHide = false;
             // ArrayList/String/PathClassLoader 均为 boot/framework 类加载器对象, 可安全跨代传递
             java.util.ArrayList<Object> state = new java.util.ArrayList<>();
             state.add(hostClassLoader);
             state.add(hostNativeLibDir);
+            state.add(new java.util.WeakHashMap<>(mCollapsedHomeTools));
+            mCollapsedHomeTools.clear();
+            state.add(new java.util.WeakHashMap<>(mHiddenHomePromotions));
+            mHiddenHomePromotions.clear();
+            mHomeResizeTask = null;
             param.setSavedInstanceState(state);
             log(4, TAG, "Hot reloading: state saved, old generation retiring");
             return true;
@@ -223,6 +239,30 @@ public class MainHook extends XposedModule {
                 java.util.List<?> state = (java.util.List<?>) saved;
                 hostClassLoader = (ClassLoader) state.get(0);
                 hostNativeLibDir = (String) state.get(1);
+                if (state.size() > 3 && state.get(3) instanceof java.util.Map) {
+                    java.util.Map<?, ?> hidden = (java.util.Map<?, ?>) state.get(3);
+                    mainHandler.post(() -> {
+                        for (java.util.Map.Entry<?, ?> entry : hidden.entrySet()) {
+                            if (entry.getKey() instanceof View && entry.getValue() instanceof int[]) {
+                                mHiddenHomePromotions.put((View) entry.getKey(), (int[]) entry.getValue());
+                            }
+                        }
+                    });
+                }
+                if (state.size() > 2 && state.get(2) instanceof java.util.Map) {
+                    java.util.Map<?, ?> collapsed = (java.util.Map<?, ?>) state.get(2);
+                    // 热重载回调在 Binder 线程，视图恢复必须回到主线程。
+                    mainHandler.post(() -> {
+                        for (java.util.Map.Entry<?, ?> entry : collapsed.entrySet()) {
+                            if (entry.getKey() instanceof View && entry.getValue() instanceof Integer) {
+                                View view = (View) entry.getKey();
+                                if (!view.isAttachedToWindow()) continue;
+                                view.setVisibility((Integer) entry.getValue());
+                                refreshHomeToolsSize(view, view.getHeight());
+                            }
+                        }
+                    });
+                }
                 log(4, TAG, "Hot reloaded: reinstalling hooks for " + TARGET_PACKAGE);
                 installAllHooks(hostClassLoader, hostNativeLibDir);
             } else {
@@ -240,29 +280,36 @@ public class MainHook extends XposedModule {
         // 核心 Hook A: 模仿青少年模式拦截 Tab 初始化 (Source of Truth)
         try {
             Class<?> extensionsKtCls = classLoader.loadClass("com.wifitutu.widget.maintab.ExtentionsKt");
-            Class<?> yCls = classLoader.loadClass("com.wifitutu.widget.maintab.y");
-            final Object teenagerEnum = Enum.valueOf((Class<Enum>) yCls, "TEENAGER");
-
+            Method tabFilter = null;
             for (Method m : extensionsKtCls.getDeclaredMethods()) {
-                if (m.getName().equals("a") && m.getParameterCount() == 1) {
-                    hook(m).intercept(chain -> {
-                        Object result = chain.proceed();
-                        if (result != null) return result; // 原生已拦截
-
-                        Object iVar = chain.getArgs().get(0);
-                        try {
-                            Method getIdMethod = iVar.getClass().getMethod("getId");
-                            String id = (String) getIdMethod.invoke(iVar);
-                            String prefKey = mapTabIdToPrefKey(id);
-                            if (prefKey != null && isFeatureEnabled(prefKey, false)) {
-                                log(4, TAG, "Simplified bottom bar (Filter): " + id);
-                                return teenagerEnum;
-                            }
-                        } catch (Exception ignored) {}
-                        return null;
-                    });
+                if (!m.getName().equals("a") || !Modifier.isStatic(m.getModifiers())
+                        || m.getParameterCount() != 1 || !m.getReturnType().isEnum()) {
+                    continue;
                 }
+                if (tabFilter != null) throw new IllegalStateException("Ambiguous tab filter");
+                tabFilter = m;
             }
+            if (tabFilter == null) throw new NoSuchMethodException("Tab filter");
+
+            Method getId = tabFilter.getParameterTypes()[0].getMethod("getId");
+            if (getId.getReturnType() != String.class) throw new NoSuchMethodException("String getId()");
+            // 5.2.52 移动了枚举类，从实际方法签名取类型。
+            Object teenagerEnum = Enum.valueOf(tabFilter.getReturnType().asSubclass(Enum.class), "TEENAGER");
+            hook(tabFilter).intercept(chain -> {
+                Object result = chain.proceed();
+                if (result != null) return result; // 原生已拦截
+
+                try {
+                    String id = (String) getId.invoke(chain.getArgs().get(0));
+                    String prefKey = mapTabIdToPrefKey(id);
+                    if (prefKey != null && isFeatureEnabled(prefKey, false)) {
+                        log(4, TAG, "Simplified bottom bar (Filter): " + id);
+                        return teenagerEnum;
+                    }
+                } catch (Exception ignored) {}
+                return null;
+            });
+            log(4, TAG, "Hooked tab filter: " + tabFilter);
         } catch (Exception e) {
             log(6, TAG, "Failed to hook ExtentionsKt.a: " + e.getMessage());
         }
@@ -355,6 +402,7 @@ public class MainHook extends XposedModule {
             case "film": return "hide_tab_film";
             case "ai": return "hide_tab_ai";
             case "kouxin": return "hide_tab_kouxin";
+            case "game": return "hide_tab_game";
             default: return null;
         }
     }
@@ -533,27 +581,536 @@ public class MainHook extends XposedModule {
     }
 
 
-    // 隐藏广告横幅、立即加速按钮等特殊 View
+    /**
+     * 首页金刚区(工具网格 rn_layout, 由 React Native 渲染)里的运营/推广位名称。
+     * 这些格子与真实工具同处一个网格, 数据由服务端下发(getConnTools), 内容为购物/短视频/App 下载等广告位,
+     * 既不属于 connect_tools_config 的工具项, 也没有资源 id, 只能在视图层按名称识别 —— 受 remove_ads 控制。
+     */
+    private static final String[] HOME_PROMO_NAMES = {
+        "福利商城", "看看", "附近的人", "随身WiFi", "智能日历", "一句记账",
+        "AI趣味照", "记加班", "记工簿", "今日运势", "消灭星星", "水果消消乐",
+        "算 24 点", "算24点", "马戏团连线", "每日赛事", "每日数独", "打企鹅"
+    };
+
+    private boolean isHomePromo(String name) {
+        if (name == null) return false;
+        for (String promo : HOME_PROMO_NAMES) {
+            if (promo.equals(name)) return true;
+        }
+        return false;
+    }
+
+    // 隐藏广告横幅、立即加速按钮、金刚区广告位等特殊 View
     private void hideSpecialViews(android.view.ViewGroup root) {
-        // 广告横幅 — 受 remove_ads 控制
+        // 广告横幅 + 首页金刚区广告位 — 受 remove_ads 控制
         if (isFeatureEnabled("remove_ads", false)) {
-            hideViewById(root, "ad_banner");
+            try {
+                hideViewById(root, "ad_banner");
+            } catch (Throwable ignored) {}
+            try {
+                hideHomePromoItems(root);
+            } catch (Throwable t) {
+                log(6, TAG, "hideHomePromoItems error: " + t);
+            }
         }
         // 立即加速 — 受 hide_speed_up 控制
         if (isFeatureEnabled("hide_speed_up", false)) {
-            hideViewById(root, "speed_up_layout");
+            try {
+                hideViewById(root, "speed_up_layout");
+            } catch (Throwable ignored) {}
         }
         // 工具栏 — 受各工具开关控制
         if (isAnyToolHideEnabled()) {
-            hideToolsInView(root);
-            // 隐藏 rnLayout 容器以消除空白
-            hideViewById(root, "rnLayout");
+            try {
+                hideToolsInView(root);
+            } catch (Throwable ignored) {}
+        }
+        collapseEmptyHomeTools(root);
+        updateHomePromotions(root);
+        // 右下角浮动广告气泡 (典典帮你支招 / 签到领现金) — 视图层兜底
+        if (isAdBubbleBlocked()) {
+            try {
+                hideBubbleOverlay(root);
+            } catch (Throwable t) {
+                log(6, TAG, "hideBubbleOverlay error: " + t);
+            }
+        }
+        // 底栏「游戏」标签 — 有开关时从 HomeTabLayout 里摘掉, 让底栏按剩余标签重新均分
+        if (isFeatureEnabled("hide_tab_game", true)) {
+            try {
+                removeGameTab(root);
+            } catch (Throwable t) {
+                log(6, TAG, "removeGameTab error: " + t);
+            }
         }
     }
 
-    private void hideRnLayoutArea(android.view.ViewGroup root) {
-        // 遍历查找 rnLayout 并隐藏
-        hideViewById(root, "rnLayout");
+    /**
+     * 移除底栏「游戏」标签。
+     * 标签列表由 HomeTabLayout.setTabs(List<ml0.i>) 灌入, 且通常在模块拿到控制权之前就已构建,
+     * 因此这里走 HomeTabLayout 自带的 removeTabs(List<String>) —— 按名称找到 tab 再按 id 移除,
+     * 比直接隐藏 View 更好: 剩下的标签会自动重新等分布局。
+     */
+    private void removeGameTab(android.view.View root) {
+        try {
+            android.view.View tabLayout = findViewByClassName(root, "com.wifitutu.widget.maintab.HomeTabLayout");
+            if (tabLayout == null) return;
+
+            Object tabs = tabLayout.getClass().getMethod("getTabs").invoke(tabLayout);
+            if (!(tabs instanceof java.util.List)) return;
+
+            String gameId = null;
+            for (Object tab : (java.util.List<?>) tabs) {
+                if (tab == null) continue;
+                String name;
+                try {
+                    name = (String) tab.getClass().getMethod("getName").invoke(tab);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+                if ("游戏".equals(name)) {
+                    try {
+                        gameId = (String) tab.getClass().getMethod("getId").invoke(tab);
+                    } catch (Throwable ignored) {}
+                    break;
+                }
+            }
+            if (gameId == null) return;
+
+            java.util.List<String> ids = new java.util.ArrayList<>();
+            ids.add(gameId);
+            tabLayout.getClass().getMethod("removeTabs", java.util.List.class).invoke(tabLayout, ids);
+            log(4, TAG, "Removed bottom tab: " + gameId);
+        } catch (Throwable t) {
+            log(6, TAG, "removeGameTab failed: " + t);
+        }
+    }
+
+    /** 按类名深度查找 View */
+    private android.view.View findViewByClassName(android.view.View root, String className) {
+        java.util.List<android.view.View> stack = new java.util.ArrayList<>();
+        stack.add(root);
+        while (!stack.isEmpty()) {
+            android.view.View v = stack.remove(stack.size() - 1);
+            if (className.equals(v.getClass().getName())) return v;
+            if (v instanceof android.view.ViewGroup) {
+                android.view.ViewGroup g = (android.view.ViewGroup) v;
+                for (int i = 0; i < g.getChildCount(); i++) {
+                    stack.add(g.getChildAt(i));
+                }
+            }
+        }
+        return null;
+    }
+
+    /** 隐藏金刚区里的运营/广告格子 (每格 = 图标 ViewGroup + 文字 TextView) */
+    private void hideHomePromoItems(android.view.ViewGroup root) {
+        java.util.List<android.view.View> stack = new java.util.ArrayList<>();
+        stack.add(root);
+        while (!stack.isEmpty()) {
+            android.view.View v = stack.remove(stack.size() - 1);
+            if (!(v instanceof android.view.ViewGroup)) continue;
+            android.view.ViewGroup group = (android.view.ViewGroup) v;
+            String label = gridItemLabel(group);
+            if (label != null && isHomePromo(label)) {
+                if (group.getVisibility() != android.view.View.GONE) {
+                    group.setVisibility(android.view.View.GONE);
+                    log(4, TAG, "Hid home promo: " + label);
+                }
+                continue; // 命中即整格隐藏, 无需再深入
+            }
+            for (int i = 0; i < group.getChildCount(); i++) {
+                stack.add(group.getChildAt(i));
+            }
+        }
+    }
+
+    private final java.util.Map<View, Integer> mCollapsedHomeTools = new java.util.WeakHashMap<>();
+    private Boolean mSupportsHomeToolsResize;
+    private final java.util.Map<View, int[]> mHiddenHomePromotions = new java.util.WeakHashMap<>();
+    private Runnable mHomeResizeTask;
+
+    private boolean supportsHomeLayout(Context context) {
+        if (mSupportsHomeToolsResize == null) {
+            try {
+                mSupportsHomeToolsResize = context.getPackageManager()
+                        .getPackageInfo(TARGET_PACKAGE, 0).getLongVersionCode() == 261104;
+                if (!mSupportsHomeToolsResize) log(5, TAG, "Home layout adaptation requires host 261104");
+            } catch (Exception e) {
+                return false;
+            }
+        }
+        return mSupportsHomeToolsResize;
+    }
+
+    private boolean setHomePromotionHidden(View view, boolean hidden, boolean collapseHeight) {
+        if (view == null || view.getLayoutParams() == null) return false;
+        ViewGroup.LayoutParams params = view.getLayoutParams();
+        int[] original = mHiddenHomePromotions.get(view);
+        if (!hidden) {
+            if (original == null) return false;
+            mHiddenHomePromotions.remove(view);
+            if (view.getVisibility() == View.GONE) view.setVisibility(original[0]);
+            if (collapseHeight && params.height == 0) {
+                params.height = original[1];
+                view.setLayoutParams(params);
+            }
+            return true;
+        }
+        if (view.getVisibility() == View.GONE && (!collapseHeight || params.height == 0)) return false;
+        if (original == null) {
+            mHiddenHomePromotions.put(view, new int[]{view.getVisibility(), params.height});
+        } else if (view.getVisibility() != View.GONE) {
+            original[0] = view.getVisibility();
+        }
+        view.setVisibility(View.GONE);
+        if (collapseHeight && params.height != 0) {
+            params.height = 0;
+            view.setLayoutParams(params);
+        }
+        return true;
+    }
+
+    private void updateHomePromotions(ViewGroup root) {
+        if (!supportsHomeLayout(root.getContext())) return;
+        int homeId = root.getResources().getIdentifier("layout_parent", "id", TARGET_PACKAGE);
+        View home = homeId == 0 ? null : root.findViewById(homeId);
+        if (home == null) return;
+        int listId = home.getResources().getIdentifier("wifi_list", "id", TARGET_PACKAGE);
+        View list = listId == 0 ? null : home.findViewById(listId);
+        if (!(list instanceof ViewGroup)
+                || !list.getClass().getName().equals("com.wifitutu_common.ui.WifiList")) return;
+        boolean hidden = isFeatureEnabled("remove_ads", false);
+        boolean resized = false;
+        for (String name : new String[]{"state_layout", "crh_state_layout"}) {
+            int id = home.getResources().getIdentifier(name, "id", TARGET_PACKAGE);
+            if (id != 0) resized |= setHomePromotionHidden(home.findViewById(id), hidden, false);
+        }
+        ViewGroup rows = (ViewGroup) list;
+        int mapId = home.getResources().getIdentifier("map_layout", "id", TARGET_PACKAGE);
+        for (int i = 0; i < rows.getChildCount(); i++) {
+            View row = rows.getChildAt(i);
+            if (mapId != 0 && row.getId() == mapId) setHomePromotionHidden(row, hidden, true);
+        }
+        if (resized) {
+            View tools = findViewByClassName(home, "com.wifitutu.ui.view.RnHomesView");
+            if (tools != null) refreshHomeToolsSize(tools, tools.getVisibility() == View.GONE ? 0 : tools.getHeight());
+        }
+    }
+
+    private void hookWifiMapRow(ClassLoader classLoader) {
+        try {
+            Class<?> adapter = classLoader.loadClass("com.wifitutu_common.ui.WifiList$WifiAdapter");
+            Class<?> holder = classLoader.loadClass("com.wifitutu.tutu_monitor.monitor.BindingViewHolder");
+            Method bind = adapter.getDeclaredMethod("o", holder, int.class);
+            Method getBinding = holder.getMethod("g");
+            Class<?> mapBinding = classLoader.loadClass("com.wifitutu_common.databinding.ItemWifiMapBinding");
+            Field itemView = holder.getField("itemView");
+            if (bind.getReturnType() != void.class || itemView.getType() != View.class
+                    || !getBinding.getReturnType().isAssignableFrom(mapBinding)) {
+                throw new NoSuchMethodException("Unexpected WiFi row binding signature");
+            }
+            hook(bind).intercept(chain -> {
+                View row = (View) itemView.get(chain.getArgs().get(0));
+                if (!supportsHomeLayout(row.getContext())) return chain.proceed();
+                // 先归还上次绑定的布局属性，避免复用把零高度带到新的列表项。
+                setHomePromotionHidden(row, false, true);
+                Object result = chain.proceed();
+                int mapId = row.getResources().getIdentifier("map_layout", "id", TARGET_PACKAGE);
+                if (mapId != 0 && row.getId() == mapId
+                        && mapBinding.isInstance(getBinding.invoke(chain.getArgs().get(0)))) {
+                    setHomePromotionHidden(row, isFeatureEnabled("remove_ads", false), true);
+                }
+                return result;
+            });
+            log(4, TAG, "Hooked WiFi map row binding");
+        } catch (Exception e) {
+            log(5, TAG, "Failed to hook WiFi map row: " + e.getMessage());
+        }
+    }
+
+    private void collapseEmptyHomeTools(ViewGroup root) {
+        View tools = findViewByClassName(root, "com.wifitutu.ui.view.RnHomesView");
+        if (!(tools instanceof ViewGroup)) return;
+        if (!supportsHomeLayout(tools.getContext())) return;
+        ViewGroup group = (ViewGroup) tools;
+        if (group.getChildCount() == 0) return;
+        boolean enabled = isFeatureEnabled("remove_ads", false) || isAnyToolHideEnabled();
+        if (!enabled || hasVisibleToolContent(group)) {
+            Integer visibility = mCollapsedHomeTools.remove(tools);
+            if (visibility != null) {
+                tools.setVisibility(visibility);
+                refreshHomeToolsSize(tools, tools.getHeight());
+            }
+        } else if (tools.getVisibility() == View.VISIBLE) {
+            // RN 隐藏子格子不会重算 Yoga 高度，空网格需连同外层占位一起收起。
+            mCollapsedHomeTools.put(tools, tools.getVisibility());
+            tools.setVisibility(View.GONE);
+            refreshHomeToolsSize(tools, 0);
+            log(4, TAG, "Collapsed empty home tools, height=" + tools.getHeight());
+        }
+    }
+
+    private void refreshHomeToolsSize(View tools, int height) {
+        if (mHomeResizeTask != null) mainHandler.removeCallbacks(mHomeResizeTask);
+        mHomeResizeTask = () -> {
+            mHomeResizeTask = null;
+            if (!tools.isAttachedToWindow()) return;
+            try {
+                // 5.2.52 用此回调更新 defaultMarginTop 并重测 scrollLayout；GONE 不会触发 onSizeChanged。
+                Field callbackField = tools.getClass().getDeclaredField("onSizeChanged");
+                callbackField.setAccessible(true);
+                Object callback = callbackField.get(tools);
+                if (callback == null) return;
+                callback.getClass().getMethod("invoke", Object.class, Object.class, Object.class, Object.class)
+                        .invoke(callback, tools.getWidth(), height, tools.getWidth(), tools.getHeight());
+            } catch (Exception e) {
+                log(5, TAG, "Failed to refresh home tools size: " + e.getMessage());
+            }
+        };
+        mainHandler.post(mHomeResizeTask);
+    }
+
+    private boolean hasVisibleToolContent(ViewGroup group) {
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            if (child.getVisibility() == View.GONE) continue;
+            if (child instanceof ViewGroup) {
+                if (hasVisibleToolContent((ViewGroup) child)) return true;
+            } else if (!(child instanceof TextView)
+                    || ((TextView) child).getText().length() > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 识别金刚区单个格子: 恰有一个非空文字子 View + 至少一处图标; 非格子返回 null */
+    private String gridItemLabel(android.view.ViewGroup group) {
+        String text = null;
+        int textCount = 0;
+        boolean hasIcon = false;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            android.view.View child = group.getChildAt(i);
+            if (child instanceof TextView) {
+                CharSequence cs = ((TextView) child).getText();
+                String t = cs == null ? "" : cs.toString().trim();
+                if (!t.isEmpty()) {
+                    text = t;
+                    textCount++;
+                }
+            } else if (child instanceof android.widget.ImageView) {
+                hasIcon = true;
+            } else if (child instanceof android.view.ViewGroup && containsImageView((android.view.ViewGroup) child)) {
+                hasIcon = true;
+            }
+        }
+        if (!hasIcon || textCount != 1) return null;
+        return text;
+    }
+
+    private boolean containsImageView(android.view.ViewGroup group) {
+        for (int i = 0; i < group.getChildCount(); i++) {
+            android.view.View child = group.getChildAt(i);
+            if (child instanceof android.widget.ImageView) return true;
+            if (child instanceof android.view.ViewGroup && containsImageView((android.view.ViewGroup) child)) return true;
+        }
+        return false;
+    }
+
+    /** 首页根 View 的布局监听 — 与 HomeDialog 绑定路径解耦, 保证金刚区每次重绘后都会重新应用隐藏 */
+    private View mHomeWatchRoot;
+    private android.view.ViewTreeObserver.OnGlobalLayoutListener mHomeWatchListener;
+    private final View.OnAttachStateChangeListener mHomeAttachListener = new View.OnAttachStateChangeListener() {
+        @Override
+        public void onViewAttachedToWindow(View view) {}
+
+        @Override
+        public void onViewDetachedFromWindow(View view) {
+            if (view == mHomeWatchRoot) removeHomeWatch();
+        }
+    };
+
+    /**
+     * HomeMainActivity 才是首页宿主 (com.wifitutu.ui.main.MainActivity 不是它的父类),
+     * 而 HomeDialog.n0() 这条绑定路径在新版并非每次都会执行。
+     * 直接把隐藏逻辑挂在首页 Activity 的根 View 上, 避免依赖 n0。
+     */
+    private void hookHomeRootWatcher(ClassLoader classLoader) {
+        try {
+            Class<?> mainCls = classLoader.loadClass("com.wifitutu.ui.main.HomeMainActivity");
+            int hooked = 0;
+            for (Method m : mainCls.getDeclaredMethods()) {
+                String name = m.getName();
+                if (!name.equals("onResume") && !name.equals("onWindowFocusChanged")) continue;
+                try {
+                    hook(m).intercept(chain -> {
+                        Object result = chain.proceed();
+                        scheduleHomeHides(chain.getThisObject());
+                        return result;
+                    });
+                    hooked++;
+                } catch (Throwable ignored) {}
+            }
+            log(4, TAG, "Hooked HomeMainActivity lifecycle, count: " + hooked);
+        } catch (Throwable e) {
+            log(6, TAG, "Failed to hook HomeMainActivity: " + e.getMessage());
+        }
+    }
+
+    private void scheduleHomeHides(final Object activity) {
+        try {
+            if (!(activity instanceof android.app.Activity)) return;
+            final android.app.Activity act = (android.app.Activity) activity;
+            mainHandler.postDelayed(() -> installHomeWatch(act), 600);
+            mainHandler.postDelayed(() -> installHomeWatch(act), 2500);
+            mainHandler.postDelayed(() -> installHomeWatch(act), 6000);
+        } catch (Throwable t) {
+            log(6, TAG, "scheduleHomeHides error: " + t);
+        }
+    }
+
+    private void installHomeWatch(final android.app.Activity activity) {
+        try {
+            if (activity.isFinishing() || activity.isDestroyed()) return;
+            final View decor = activity.getWindow().getDecorView();
+            if (!(decor instanceof ViewGroup)) return;
+            installHomeWatch((ViewGroup) decor);
+        } catch (Throwable t) {
+            log(6, TAG, "installHomeWatch error: " + t);
+        }
+    }
+
+    private void installHomeWatch(final ViewGroup root) {
+        if (!root.isAttachedToWindow()) return;
+        hideSpecialViews(root);
+        if (root == mHomeWatchRoot) return;
+        removeHomeWatch();
+        mHomeWatchRoot = root;
+        mHomeWatchListener = () -> {
+            try {
+                hideSpecialViews(root);
+            } catch (Throwable ignored) {}
+        };
+        root.addOnAttachStateChangeListener(mHomeAttachListener);
+        root.getViewTreeObserver().addOnGlobalLayoutListener(mHomeWatchListener);
+        log(4, TAG, "Home layout watcher installed");
+    }
+
+    /**
+     * 金刚区容器 RnHomesView 构造时挂载隐藏任务。
+     * 这条路径由布局 inflate 触发, 不依赖 HomeDialog 绑定/Activity 生命周期, 时序上最可靠。
+     */
+    private void hookRnHomeView(final ClassLoader classLoader) {
+        try {
+            Class<?> rnCls = classLoader.loadClass("com.wifitutu.ui.view.RnHomesView");
+            int hooked = 0;
+            for (Constructor<?> c : rnCls.getDeclaredConstructors()) {
+                try {
+                    hook(c).intercept(chain -> {
+                        Object result = chain.proceed();
+                        Object self = chain.getThisObject();
+                        if (self instanceof android.view.View) {
+                            scheduleHideFromView((android.view.View) self);
+                        }
+                        return result;
+                    });
+                    hooked++;
+                } catch (Throwable ignored) {}
+            }
+            log(4, TAG, "Hooked RnHomesView constructors: " + hooked);
+        } catch (Throwable t) {
+            log(6, TAG, "hookRnHomeView failed: " + t);
+        }
+    }
+
+    /** 从金刚区容器向上找到首页根 View, 多次延迟 + 布局监听地应用隐藏 */
+    private void scheduleHideFromView(final android.view.View anchor) {
+        try {
+            Runnable pass = () -> {
+                try {
+                    if (!anchor.isAttachedToWindow()) return;
+                    android.view.View root = anchor;
+                    while (root.getParent() instanceof android.view.View) {
+                        root = (android.view.View) root.getParent();
+                    }
+                    if (!(root instanceof android.view.ViewGroup)) return;
+                    installHomeWatch((ViewGroup) root);
+                } catch (Throwable t) {
+                    log(6, TAG, "home hide pass error: " + t);
+                }
+            };
+            // 统一由模块 Handler 持有，热重载时才能完整取消旧代任务。
+            mainHandler.postDelayed(pass, 300);
+            mainHandler.postDelayed(pass, 1200);
+            mainHandler.postDelayed(pass, 3000);
+            mainHandler.postDelayed(pass, 6000);
+            mainHandler.postDelayed(pass, 10000);
+        } catch (Throwable t) {
+            log(6, TAG, "scheduleHideFromView failed: " + t);
+        }
+    }
+
+    /**
+     * 模块的 onPackageReady 在宿主 Application 创建后才回调, 首页布局此时往往已经 inflate 完成,
+     * 因此构造函数/Hook 回调可能错过首个实例。这里主动从 ActivityThread 里找到当前首页 Activity,
+     * 对已存在的 View 树立即应用隐藏。
+     */
+    private android.app.Activity findHomeActivity() {
+        try {
+            Class<?> atCls = Class.forName("android.app.ActivityThread");
+            Object at = atCls.getMethod("currentActivityThread").invoke(null);
+            Field f = atCls.getDeclaredField("mActivities");
+            f.setAccessible(true);
+            Object map = f.get(at);
+            if (map == null) return null;
+            java.lang.reflect.Method valuesMethod = map.getClass().getMethod("values");
+            java.util.Collection<?> records = (java.util.Collection<?>) valuesMethod.invoke(map);
+            android.app.Activity fallback = null;
+            for (Object rec : records) {
+                if (rec == null) continue;
+                Field af = rec.getClass().getDeclaredField("activity");
+                af.setAccessible(true);
+                Object a = af.get(rec);
+                if (!(a instanceof android.app.Activity)) continue;
+                android.app.Activity act = (android.app.Activity) a;
+                if (act.isFinishing() || act.isDestroyed()) continue;
+                if (act.getClass().getName().equals("com.wifitutu.ui.main.HomeMainActivity")) return act;
+                if (fallback == null) fallback = act;
+            }
+            return fallback;
+        } catch (Throwable t) {
+            log(6, TAG, "findHomeActivity failed: " + t);
+            return null;
+        }
+    }
+
+    /** 安装 hook 后主动补一次首页隐藏 (覆盖 hook 前已创建的 View 树) */
+    private void scheduleStartupHomeHides() {
+        for (int delay : new int[]{1000, 3000, 6000, 12000}) {
+            mainHandler.postDelayed(() -> {
+                try {
+                    android.app.Activity act = findHomeActivity();
+                    if (act != null) installHomeWatch(act);
+                } catch (Throwable ignored) {}
+            }, delay);
+        }
+    }
+
+    private void removeHomeWatch() {
+        try {
+            if (mHomeWatchRoot != null && mHomeWatchListener != null) {
+                android.view.ViewTreeObserver observer = mHomeWatchRoot.getViewTreeObserver();
+                if (observer.isAlive()) observer.removeOnGlobalLayoutListener(mHomeWatchListener);
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (mHomeWatchRoot != null) {
+                mHomeWatchRoot.removeOnAttachStateChangeListener(mHomeAttachListener);
+            }
+            mHomeWatchRoot = null;
+            mHomeWatchListener = null;
+        }
     }
 
     private boolean isAnyToolHideEnabled() {
@@ -1089,6 +1646,34 @@ public class MainHook extends XposedModule {
 
     private void hookAds(ClassLoader classLoader) {
         try {
+            Class<?> launcherClass = classLoader.loadClass("com.wifitutu.ui.launcher.LauncherActivity");
+            Method loadSplashAd = launcherClass.getDeclaredMethod("S0", int.class, int.class, boolean.class);
+            Field noSplash = launcherClass.getDeclaredField("d0");
+            if (loadSplashAd.getReturnType() != void.class || noSplash.getType() != boolean.class) {
+                throw new IllegalStateException("Unexpected splash ad signature");
+            }
+            noSplash.setAccessible(true);
+            hook(loadSplashAd).intercept(chain -> {
+                if (!isFeatureEnabled("remove_ads", false)) return chain.proceed();
+                android.app.Activity launcher = (android.app.Activity) chain.getThisObject();
+                // 5.2.52 的 d0 是 noSplash，宿主会自行结束开屏并继续启动。
+                if (launcher.getPackageManager().getPackageInfo(TARGET_PACKAGE, 0).getLongVersionCode() != 261104) {
+                    return chain.proceed();
+                }
+                boolean original = noSplash.getBoolean(launcher);
+                noSplash.setBoolean(launcher, true);
+                try {
+                    log(4, TAG, "Skipping splash ad load");
+                    return chain.proceed();
+                } finally {
+                    noSplash.setBoolean(launcher, original);
+                }
+            });
+        } catch (Exception e) {
+            log(5, TAG, "Failed to hook splash ads: " + e.getMessage());
+        }
+
+        try {
             Class<?> abstractAdsClass = classLoader.loadClass("com.wifi.business.potocol.sdk.base.ad.AbstractAds");
             for (Method m : abstractAdsClass.getDeclaredMethods()) {
                 if (m.getName().equals("isBlocked") && m.getParameterCount() == 0) {
@@ -1131,6 +1716,9 @@ public class MainHook extends XposedModule {
                             if (isFeatureEnabled("unlock_vip", false)) {
                                 hideVipBanners(frag, isFeatureEnabled("deep_clean_vip", false));
                             }
+                            if (isFeatureEnabled("block_update", true)) {
+                                hideUpdateDot(frag);
+                            }
                             injectCustomSettings(frag);
                         } catch (Exception ignored) {}
                         return result;
@@ -1141,6 +1729,62 @@ public class MainHook extends XposedModule {
         } catch (Throwable e) {
             log(6, TAG, "Failed to hook MeFragment: " + e.getMessage());
         }
+    }
+
+    /**
+     * 禁止更新。
+     * 更新逻辑入口: ba0.e implements ll0.l1 → wq(Context, boolean) → 订阅版本检查并弹窗。
+     * 手动「检查更新」(MeFragment.D0) 与自动检查都走这里, 因此在 wq 上拦截;
+     * 另外兜底挂一次 MeFragment.D0, 防止宿主改实现类。
+     */
+    private void hookAppUpdate(ClassLoader classLoader) {
+        try {
+            Class<?> impl = classLoader.loadClass("ba0.e");
+            for (Method m : impl.getDeclaredMethods()) {
+                if (!m.getName().equals("wq") || m.getParameterCount() != 2) continue;
+                if (m.getParameterTypes()[0] != Context.class || m.getParameterTypes()[1] != boolean.class) continue;
+                hook(m).intercept(chain -> {
+                    if (isFeatureEnabled("block_update", true)) {
+                        log(4, TAG, "Blocked app update check, auto=" + chain.getArgs().get(1));
+                        return null;
+                    }
+                    return chain.proceed();
+                });
+                log(4, TAG, "Hooked ba0.e.wq (app update)");
+            }
+        } catch (Throwable t) {
+            log(6, TAG, "hookAppUpdate(wq) failed: " + t.getMessage());
+        }
+
+        try {
+            Class<?> meCls = classLoader.loadClass(ME_FRAGMENT_CLASS);
+            for (Method m : meCls.getDeclaredMethods()) {
+                if (!m.getName().equals("D0") || m.getParameterCount() != 2) continue;
+                if (m.getParameterTypes()[0] != Context.class || m.getParameterTypes()[1] != boolean.class) continue;
+                hook(m).intercept(chain -> {
+                    if (isFeatureEnabled("block_update", true)) {
+                        log(4, TAG, "Blocked manual update check");
+                        return null;
+                    }
+                    return chain.proceed();
+                });
+                log(4, TAG, "Hooked MeFragment.D0 (app update)");
+            }
+        } catch (Throwable t) {
+            log(6, TAG, "hookAppUpdate(D0) failed: " + t.getMessage());
+        }
+    }
+
+    /** 「我的」页隐藏"有新版本"红点 */
+    private void hideUpdateDot(final Object meFragment) {
+        try {
+            final Object binding = findBindingField(meFragment);
+            if (binding == null) return;
+            final View dot = getFieldSafe(binding, "newVersion");
+            if (dot != null) {
+                mainHandler.post(() -> dot.setVisibility(View.GONE));
+            }
+        } catch (Throwable ignored) {}
     }
 
     private void hideVipBanners(Object meFragment, boolean deepClean) {
@@ -1190,7 +1834,7 @@ public class MainHook extends XposedModule {
     private void performInjection(View anchor) {
         final Context context = anchor.getContext();
         View p = (View) anchor.getParent();
-        
+
         if (!(p instanceof LinearLayout)) {
             if (p != null && p.getParent() instanceof LinearLayout) {
                 anchor = p;
@@ -1203,34 +1847,89 @@ public class MainHook extends XposedModule {
         LinearLayout parent = (LinearLayout) p;
         if (parent.findViewWithTag("wifikey_xposed_entry") != null) return;
 
-        TextView customSetting = new TextView(context);
-        customSetting.setTag("wifikey_xposed_entry");
-        customSetting.setText("Wifi万能钥匙增强");
-        customSetting.setTextSize(16);
-        customSetting.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        
+        // 直接克隆原生菜单项外观 (aboutUs / privacyPolicy 等同款 TextView):
+        // 字号/颜色/字体/内边距/右侧箭头全部取自真实菜单项, 不再自己拼一个"外来户"样式
+        TextView item = new TextView(context);
+        item.setTag("wifikey_xposed_entry");
+        item.setText("Wifi万能钥匙增强");
+
         if (anchor instanceof TextView) {
-            customSetting.setTextColor(((TextView) anchor).getTextColors());
-            customSetting.setPadding(anchor.getPaddingLeft(), anchor.getPaddingTop(), anchor.getPaddingRight(), anchor.getPaddingBottom());
+            TextView src = (TextView) anchor;
+            item.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, src.getTextSize());
+            item.setTextColor(src.getTextColors());
+            item.setTypeface(src.getTypeface());
+            item.setGravity(src.getGravity());
+            item.setIncludeFontPadding(src.getIncludeFontPadding());
+            item.setPadding(src.getPaddingLeft(), src.getPaddingTop(), src.getPaddingRight(), src.getPaddingBottom());
+            android.graphics.drawable.Drawable[] arrows = src.getCompoundDrawablesRelative();
+            android.graphics.drawable.Drawable arrow = cloneDrawable(arrows != null && arrows.length > 2 ? arrows[2] : null);
+            if (arrow == null) {
+                android.graphics.drawable.Drawable[] absArrows = src.getCompoundDrawables();
+                arrow = cloneDrawable(absArrows != null && absArrows.length > 2 ? absArrows[2] : null);
+            }
+            if (arrow != null) {
+                item.setCompoundDrawablesRelativeWithIntrinsicBounds(null, null, arrow, null);
+            } else {
+                // 兜底: 直接用宿主自己的箭头资源 (与菜单项 @drawable/wkr_icon_arrow_white 一致)
+                try {
+                    int arrowId = context.getResources().getIdentifier("wkr_icon_arrow_white", "drawable", TARGET_PACKAGE);
+                    if (arrowId != 0) {
+                        item.setCompoundDrawablesRelativeWithIntrinsicBounds(0, 0, arrowId, 0);
+                    }
+                } catch (Throwable ignored) {}
+            }
+            item.setBackground(cloneDrawable(src.getBackground()));
         } else {
             int pad = (int) (16 * context.getResources().getDisplayMetrics().density);
-            customSetting.setPadding(pad, pad, pad, pad);
+            item.setPadding(pad, pad, pad, pad);
         }
-        
-        customSetting.setLayoutParams(anchor.getLayoutParams());
-        customSetting.setOnClickListener(v -> {
+
+        item.setClickable(true);
+        if (anchor.getLayoutParams() != null) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(anchor.getLayoutParams());
+            lp.height = LinearLayout.LayoutParams.WRAP_CONTENT;
+            item.setLayoutParams(lp);
+        }
+        item.setOnClickListener(v -> {
             Intent intent = new Intent();
             intent.setComponent(new ComponentName("com.ty.wifikeyxposed", "com.ty.wifikeyxposed.SettingsActivity"));
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             context.startActivity(intent);
         });
 
-        int index = parent.indexOfChild(anchor);
-        parent.addView(customSetting, index + 1);
-        
+        // 放在菜单最前面
+        parent.addView(item, 0);
+
+        // 原生分隔线: 优先复制兄弟节点的分隔线(高/背景完全一致), 否则退回 @style/line 的 1.5dp + #f2f2f2
+        View sampleDivider = null;
+        for (int i = 0; i < parent.getChildCount(); i++) {
+            View child = parent.getChildAt(i);
+            if (child.getClass() == View.class) {
+                sampleDivider = child;
+                break;
+            }
+        }
         View divider = new View(context);
-        divider.setBackgroundColor(Color.parseColor("#EEEEEE"));
-        parent.addView(divider, index + 1, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2));
+        if (sampleDivider != null) {
+            divider.setBackground(cloneDrawable(sampleDivider.getBackground()));
+            divider.setLayoutParams(new LinearLayout.LayoutParams(sampleDivider.getLayoutParams()));
+        } else {
+            divider.setBackgroundColor(Color.parseColor("#f2f2f2"));
+            int dividerHeight = Math.max(1, Math.round(1.5f * context.getResources().getDisplayMetrics().density));
+            divider.setLayoutParams(new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dividerHeight));
+        }
+        parent.addView(divider, 1);
+    }
+
+    /** 复用同款 Drawable (箭头/背景) 时克隆一份, 避免共享 ConstantState 导致状态串台 */
+    private android.graphics.drawable.Drawable cloneDrawable(android.graphics.drawable.Drawable src) {
+        if (src == null) return null;
+        try {
+            android.graphics.drawable.Drawable.ConstantState cs = src.getConstantState();
+            return cs != null ? cs.newDrawable() : src;
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     private void hookVipStatus(ClassLoader classLoader) {
@@ -1524,46 +2223,111 @@ public class MainHook extends XposedModule {
     }
 
     /**
-     * 屏蔽主界面"签到领现金"广告气泡 BubbleView
-     * 
-     * com.wifitutu.ui.bubble.BubbleView — 主界面广告浮球
-     * showBubbleIfOrNot(int tab) 控制显示，void 方法
-     * refreshBubbleView() 内部调 setVisibility(VISIBLE) 显示
-     * 
-     * 策略: 拦截 showBubbleIfOrNot → 直接 return，不执行刷新逻辑
+     * 屏蔽首页右下角浮动广告气泡 (com.wifitutu.ui.bubble.*)，包含「典典帮你支招」和「签到领现金」。
+     *
+     * 5.2.52 的真实结构: BubbleHostView(容器, 按 AB 开关 new BubbleView 或 BubbleViewV2),
+     * 真正负责显示的是私有方法 refreshBubbleView()，数据入口是 fetchDataIfNecessary()。
+     * 旧版只挂了 showBubbleIfOrNot / fetchData，这两个在 5.2.52 都不是实际执行路径 (后者根本不存在)，
+     * 所以气泡依旧会出现。
      */
     private void hookFloatingBall(ClassLoader classLoader) {
-        if (!isFeatureEnabled("block_coin_task_ball", false)) return;
+        String[] classes = {
+            "com.wifitutu.ui.bubble.BubbleView",
+            "com.wifitutu.ui.bubble.BubbleViewV2"
+        };
+        int hooked = 0;
+        for (String className : classes) {
+            try {
+                Class<?> cls = classLoader.loadClass(className);
+                for (Method m : cls.getDeclaredMethods()) {
+                    String mn = m.getName();
+                    if (m.getReturnType() != void.class) continue;
+                    boolean target = mn.equals("refreshBubbleView")
+                            || mn.equals("fetchDataIfNecessary")
+                            || mn.equals("showBubbleIfOrNot")
+                            || mn.equals("access$refreshBubbleView");
+                    if (!target) continue;
+                    try {
+                        hook(m).intercept(chain -> {
+                            if (isAdBubbleBlocked()) {
+                                log(4, TAG, "Blocked ad bubble: " + chain.getExecutable().getName());
+                                return null; // void 方法, 直接跳过显示/拉取
+                            }
+                            return chain.proceed();
+                        });
+                        hooked++;
+                    } catch (Throwable ignored) {}
+                }
+            } catch (Throwable ignored) {}
+        }
+        log(4, TAG, "hookFloatingBall installed: " + hooked);
+    }
 
+    /**
+     * 屏蔽启动时的「恭喜!红包到账」VIP 红包弹窗。
+     *
+     * 它是广告 SDK 的全屏引导页 com.wifitutu.ad.imp.busi.entry.ui.FullscreenGuideActivity,
+     * onCreate 从 Intent 里读 isVipGuide / vipPrice / vipCouponAmount 等参数, isVipGuide=true 即红包样式。
+     * 命中后立刻 finish, 不显示该页。仅拦 VIP 红包样式, 不动其它全屏引导。
+     */
+    private void hookFullscreenGuide(ClassLoader classLoader) {
         try {
-            Class<?> bubbleViewCls = classLoader.loadClass("com.wifitutu.ui.bubble.BubbleView");
-
-            // 拦截 showBubbleIfOrNot — 直接 return，不设置 currentTab 也不调 refreshBubbleView
-            for (Method m : bubbleViewCls.getDeclaredMethods()) {
-                if (m.getName().equals("showBubbleIfOrNot")) {
+            Class<?> cls = classLoader.loadClass("com.wifitutu.ad.imp.busi.entry.ui.FullscreenGuideActivity");
+            boolean hooked = false;
+            for (Method m : cls.getDeclaredMethods()) {
+                if (!m.getName().equals("onCreate") || m.getParameterCount() != 1) continue;
+                try {
                     hook(m).intercept(chain -> {
-                        log(4, TAG, "Blocked BubbleView.showBubbleIfOrNot() — 广告气泡已屏蔽");
-                        return null; // void 方法，直接返回
+                        Object result = chain.proceed();
+                        try {
+                            if (isFeatureEnabled("remove_ads", false)
+                                    && chain.getThisObject() instanceof android.app.Activity) {
+                                android.app.Activity act = (android.app.Activity) chain.getThisObject();
+                                android.content.Intent intent = act.getIntent();
+                                if (intent != null
+                                        && (intent.getBooleanExtra("isVipGuide", false)
+                                            || intent.getIntExtra("vipCouponAmount", 0) > 0)) {
+                                    log(4, TAG, "Blocked VIP red-packet guide ad");
+                                    act.finish();
+                                }
+                            }
+                        } catch (Throwable ignored) {}
+                        return result;
                     });
-                    log(4, TAG, "Hooked BubbleView.showBubbleIfOrNot()");
-                    break;
+                    hooked = true;
+                } catch (Throwable ignored) {}
+            }
+            log(4, TAG, "Hooked FullscreenGuideActivity: " + hooked);
+        } catch (Throwable t) {
+            log(6, TAG, "hookFullscreenGuide failed: " + t);
+        }
+    }
+
+    /** 浮动广告气泡: 「去除内置广告」或「主页广告气泡」任一开启即屏蔽 */
+    private boolean isAdBubbleBlocked() {
+        return isFeatureEnabled("remove_ads", false) || isFeatureEnabled("block_coin_task_ball", false);
+    }
+
+    /** 视图层兜底: 隐藏 com.wifitutu.ui.bubble 下的浮层容器 (BubbleHostView / BubbleView / BubbleViewV2) */
+    private void hideBubbleOverlay(android.view.ViewGroup root) {
+        java.util.List<android.view.View> stack = new java.util.ArrayList<>();
+        stack.add(root);
+        while (!stack.isEmpty()) {
+            android.view.View v = stack.remove(stack.size() - 1);
+            String className = v.getClass().getName();
+            if (className.startsWith("com.wifitutu.ui.bubble.")) {
+                if (v.getVisibility() != android.view.View.GONE) {
+                    v.setVisibility(android.view.View.GONE);
+                    log(4, TAG, "Hid ad bubble: " + className);
+                }
+                continue;
+            }
+            if (v instanceof android.view.ViewGroup) {
+                android.view.ViewGroup g = (android.view.ViewGroup) v;
+                for (int i = 0; i < g.getChildCount(); i++) {
+                    stack.add(g.getChildAt(i));
                 }
             }
-
-            // 拦截 fetchData — 阻止广告数据加载，避免网络请求浪费
-            for (Method m : bubbleViewCls.getDeclaredMethods()) {
-                if (m.getName().equals("fetchData")) {
-                    hook(m).intercept(chain -> {
-                        log(4, TAG, "Blocked BubbleView.fetchData() — 跳过广告数据加载");
-                        return null; // void 方法
-                    });
-                    log(4, TAG, "Hooked BubbleView.fetchData()");
-                    break;
-                }
-            }
-
-        } catch (Exception e) {
-            log(6, TAG, "Failed to hook BubbleView: " + e.getMessage());
         }
     }
 

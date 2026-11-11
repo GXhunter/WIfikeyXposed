@@ -199,6 +199,7 @@ fun SettingsScreen(prefs: SharedPreferences, offlineMode: Boolean, onBack: () ->
     var blockCoinTaskBall by remember(prefs, tick) { mutableStateOf(prefs.getBoolean("block_coin_task_ball", false)) }
     var liteTeenager by remember(prefs, tick) { mutableStateOf(prefs.getBoolean("lite_teenager", false)) }
     var removeCloudControl by remember(prefs, tick) { mutableStateOf(prefs.getBoolean("remove_cloud_control", false)) }
+    var blockUpdate by remember(prefs, tick) { mutableStateOf(prefs.getBoolean("block_update", true)) }
 
     var hideToolClean by remember(prefs, tick) { mutableStateOf(prefs.getBoolean("hide_tool_clean", false)) }
     var hideToolSpeedup by remember(prefs, tick) { mutableStateOf(prefs.getBoolean("hide_tool_speedup", false)) }
@@ -250,17 +251,18 @@ fun SettingsScreen(prefs: SharedPreferences, offlineMode: Boolean, onBack: () ->
     var hideFilm by remember(prefs, tick) { mutableStateOf(prefs.getBoolean("hide_tab_film", false)) }
     var hideAi by remember(prefs, tick) { mutableStateOf(prefs.getBoolean("hide_tab_ai", false)) }
     var hideKouxin by remember(prefs, tick) { mutableStateOf(prefs.getBoolean("hide_tab_kouxin", false)) }
+    var hideGame by remember(prefs, tick) { mutableStateOf(prefs.getBoolean("hide_tab_game", true)) }
 
     var showHomeWarning by remember { mutableStateOf(false) }
     var showMeWarning by remember { mutableStateOf(false) }
 
     val allSelected = blockNews && unlockVip && deepCleanVip && removeAds && blockCoinTaskBall && liteTeenager && removeCloudControl &&
             hideNearby && hideVideo && hideWelfare && hideIm && hideWeb && hideGuard &&
-            hideDeepseek && hideShopmall && hideBus && hideFilm && hideAi && hideKouxin &&
+            hideDeepseek && hideShopmall && hideBus && hideFilm && hideAi && hideKouxin && hideGame &&
             hideToolClean && hideToolSpeedup && hideToolCooling && hideToolSpeedtest &&
             hideToolNetwork && hideToolSecurity && hideToolKuaikan && hideToolNovel && hideToolGame && hideToolMore &&
             hideToolPieces && hideToolDouyinCoupon && hideToolFriendMsg &&
-            hideToolVip && hideToolUser && hideToolIm && hideToolEmpower && hideToolDynamicCard && hideToolTarget30 && hideToolArea && hideSpeedUp
+            hideToolVip && hideToolUser && hideToolIm && hideToolEmpower && hideToolDynamicCard && hideToolTarget30 && hideToolArea && hideSpeedUp && blockUpdate
 
     // 大标题随内容滚动折叠成小标题栏 (与"全选/取消全选"同一行高度)
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
@@ -330,6 +332,7 @@ fun SettingsScreen(prefs: SharedPreferences, offlineMode: Boolean, onBack: () ->
                             putBoolean("block_coin_task_ball", target)
                             putBoolean("lite_teenager", target)
                             putBoolean("remove_cloud_control", target)
+                        putBoolean("block_update", target)
                             
                             putBoolean("hide_tab_nearby", target)
                             putBoolean("hide_tab_video", target)
@@ -343,6 +346,7 @@ fun SettingsScreen(prefs: SharedPreferences, offlineMode: Boolean, onBack: () ->
                             putBoolean("hide_tab_film", target)
                             putBoolean("hide_tab_ai", target)
                             putBoolean("hide_tab_kouxin", target)
+                        putBoolean("hide_tab_game", target)
 
                             putBoolean("hide_tool_clean", target)
                             putBoolean("hide_tool_speedup", target)
@@ -473,6 +477,18 @@ fun SettingsScreen(prefs: SharedPreferences, offlineMode: Boolean, onBack: () ->
                                 prefs.edit().putBoolean("remove_cloud_control", it).apply()
                             }
                         )
+                        HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+                        SettingItem(
+                            title = "禁止更新",
+                            subtitle = "屏蔽更新检测与「发现新版本」提示",
+                            icon = Icons.Default.SystemUpdate,
+                            checked = blockUpdate,
+                            onCheckedChange = {
+                                blockUpdate = it
+                                prefs.edit().putBoolean("block_update", it).apply()
+                            }
+                        )
+
 
                         if (removeCloudControl) {
                             Box(modifier = Modifier.padding(start = 56.dp, top = 4.dp, bottom = 12.dp, end = 16.dp)) {
@@ -633,6 +649,14 @@ fun SettingsScreen(prefs: SharedPreferences, offlineMode: Boolean, onBack: () ->
                             icon = Icons.Default.Chat,
                             checked = hideKouxin,
                             onCheckedChange = { hideKouxin = it; prefs.edit().putBoolean("hide_tab_kouxin", it).apply() }
+                        )
+                        HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+                        SettingItem(
+                            title = "精简游戏",
+                            subtitle = "隐藏底栏「游戏」标签",
+                            icon = Icons.Default.SportsEsports,
+                            checked = hideGame,
+                            onCheckedChange = { hideGame = it; prefs.edit().putBoolean("hide_tab_game", it).apply() }
                         )
                     }
                 }
@@ -804,8 +828,8 @@ fun SettingsScreen(prefs: SharedPreferences, offlineMode: Boolean, onBack: () ->
                         )
                         HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
                         SettingItem(
-                            title = "屏蔽签到浮球",
-                            subtitle = "隐藏主页右下角的「签到领现金」浮动广告球",
+                            title = "屏蔽广告浮球",
+                            subtitle = "隐藏主页右下角的「签到领现金」「典典帮你支招」浮动广告球",
                             icon = Icons.Default.Ballot,
                             checked = blockCoinTaskBall,
                             onCheckedChange = { blockCoinTaskBall = it; prefs.edit().putBoolean("block_coin_task_ball", it).apply() }

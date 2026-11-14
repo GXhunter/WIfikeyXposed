@@ -19,12 +19,17 @@
         android:theme="@style/Theme.WIfikeyXposed">
 
         <activity android:name=".SettingsActivity"
+            android:exported="true" />
+
+        <activity-alias
+            android:name=".LauncherActivity"
+            android:targetActivity=".SettingsActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+        </activity-alias>
 
     </application>
 

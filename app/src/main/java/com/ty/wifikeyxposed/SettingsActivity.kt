@@ -3,6 +3,7 @@ package com.ty.wifikeyxposed
 import android.content.ComponentName
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -182,6 +183,11 @@ fun ExpandableSection(
 @Composable
 fun SettingsScreen(prefs: SharedPreferences, offlineMode: Boolean, onBack: () -> Unit) {
     val context = LocalContext.current
+    val packageManager = context.packageManager
+    val launcher = ComponentName(context.packageName, "${context.packageName}.LauncherActivity")
+    var hideLauncherIcon by remember(launcher) {
+        mutableStateOf(packageManager.getComponentEnabledSetting(launcher) == PackageManager.COMPONENT_ENABLED_STATE_DISABLED)
+    }
 
     var tick by remember { mutableIntStateOf(0) }
     DisposableEffect(prefs) {
@@ -400,6 +406,25 @@ fun SettingsScreen(prefs: SharedPreferences, offlineMode: Boolean, onBack: () ->
                 }
                 Spacer(modifier = Modifier.height(12.dp))
             }
+
+            ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                SettingItem(
+                    title = "隐藏桌面图标",
+                    subtitle = "隐藏模块的桌面图标，可从 WiFi 万能钥匙内的模块设置恢复",
+                    icon = Icons.Default.Home,
+                    checked = hideLauncherIcon,
+                    onCheckedChange = { hidden ->
+                        packageManager.setComponentEnabledSetting(
+                            launcher,
+                            if (hidden) PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+                            else PackageManager.COMPONENT_ENABLED_STATE_DEFAULT,
+                            PackageManager.DONT_KILL_APP
+                        )
+                        hideLauncherIcon = hidden
+                    }
+                )
+            }
+            Spacer(modifier = Modifier.height(24.dp))
 
             // ─── 功能增强 ───
             ExpandableSection(

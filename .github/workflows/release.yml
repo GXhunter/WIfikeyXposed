@@ -163,8 +163,21 @@ jobs:
             echo "::error::请配置仓库变量 RELEASE_CERT_SHA256（fork 签名证书指纹）"
             exit 1
           fi
-          CERTS="$("$APKSIGNER" verify --print-certs "$OUT")"
-          ACTUAL="$(printf '%s\n' "$CERTS" | awk '/^Signer #[0-9]+ certificate SHA-256 digest: / { print toupper($NF) }')"
+          if ! CERTS="$("$APKSIGNER" verify --print-certs "$OUT")"; then
+            echo "::error::apksigner 未能验证 APK 签名"
+            exit 1
+          fi
+          # Build Tools 37 会在签名者行加上 V2/V3 等方案前缀；不要匹配 Source Stamp。
+          ACTUAL="$(printf '%s\n' "$CERTS" | awk '
+            { sub(/\r$/, "") }
+            tolower($0) ~ /^(signer #[0-9]+|v[0-9]+(\.[0-9]+)? signer( #[0-9]+)?):? certificate sha-256 digest:[[:space:]]/ {
+              print toupper($NF)
+            }
+          ' | LC_ALL=C sort -u)"
+          if [[ ! "$ACTUAL" =~ ^[0-9A-F]{64}$ ]]; then
+            echo "::error::未能提取唯一的 APK 签名证书 SHA-256 指纹"
+            exit 1
+          fi
           if [[ "$ACTUAL" != "$EXPECTED" ]]; then
             echo "::error::APK 签名证书与 fork 的预期指纹不一致"
             exit 1

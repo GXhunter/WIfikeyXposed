@@ -54,6 +54,8 @@ public class MainHook extends XposedModule {
     private static final String URI_CHECKER_CLASS = "com.wifitutu.ui.dialog.c";
     private static final String ACTION_RESTART = "com.ty.wifikeyxposed.ACTION_RESTART";
     private static final String ACTION_CLEAR_CLOUD = "com.ty.wifikeyxposed.ACTION_CLEAR_CLOUD";
+    private static final String HOST_COMMAND_PERMISSION =
+            "com.ty.wifikeyxposed.permission.SEND_HOST_COMMAND";
 
     /** 5.2.29 native bridge 生成类 (lib-native_release) — 全部为 native 方法, 汇聚了 app 所有 JNI 调用 */
     private static final String[] NATIVE_BRIDGE_CLASSES = {
@@ -155,6 +157,8 @@ public class MainHook extends XposedModule {
             log(4, TAG, "hookVipStatus 完成");
             hookBottomNavigation(classLoader);
             log(4, TAG, "hookBottomNavigation 完成");
+            hookOptionalHomeModules(classLoader);
+            hookOptionalHomeTabs(classLoader);
             hookFloatingBall(classLoader);
             log(4, TAG, "hookFloatingBall 完成");
             hookFullscreenGuide(classLoader);
@@ -172,6 +176,7 @@ public class MainHook extends XposedModule {
             // TODO: 需要分析 S1 返回值类型后再启用
             // hookHomeDialogComponents(classLoader);
             // log(4, TAG, "hookHomeDialogComponents 完成");
+            hookPostConnectPromotions(classLoader);
             hookAds(classLoader);
             log(4, TAG, "hookAds 完成");
             hookCommonFlags(classLoader);
@@ -186,6 +191,8 @@ public class MainHook extends XposedModule {
             log(4, TAG, "hookWifiSilentDelete 完成");
             hookQuickSettingsBypass(classLoader);
             log(4, TAG, "hookQuickSettingsBypass 完成");
+            hookHomeSpeedUpBadge(classLoader);
+            hookMineRecentApps(classLoader);
             hookMeFragment(classLoader);
             log(4, TAG, "hookMeFragment 完成");
             log(4, TAG, "=== hook 初始化完成 ===");
@@ -1315,11 +1322,10 @@ public class MainHook extends XposedModule {
                 IntentFilter filter = new IntentFilter();
                 filter.addAction(ACTION_RESTART);
                 filter.addAction(ACTION_CLEAR_CLOUD);
-                if (Build.VERSION.SDK_INT >= 34) {
-                    context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
-                } else {
-                    context.registerReceiver(receiver, filter);
-                }
+                // 当前 Context 属于宿主；只接收模块签名权限持有者发送的跨应用广播。
+                androidx.core.content.ContextCompat.registerReceiver(context, receiver, filter,
+                        HOST_COMMAND_PERMISSION, null,
+                        androidx.core.content.ContextCompat.RECEIVER_EXPORTED);
                 return result;
             });
         } catch (Exception e) {
@@ -1644,7 +1650,155 @@ public class MainHook extends XposedModule {
         return Integer.valueOf(0);
     }
 
+    /**
+     * 5.2.52（261104，pg0.c 变体）：正常联网后不进入自动加速或推广跳转。
+     * 保留连接结果、认证门户和用户主动打开的加速工具。
+     */
+    private void hookPostConnectPromotions(ClassLoader classLoader) {
+        try {
+            Class<?> dialogType = classLoader.loadClass("com.wifitutu.ui.dialog.ConnectDialog");
+            Class<?> stateType = classLoader.loadClass("com.wifitutu.widget.core.ConnProcessState");
+            Class<?> resultType = classLoader.loadClass("l80.o");
+            Class<?> appType = classLoader.loadClass("com.wifitutu.ui.launcher.TuTuApp");
+            Class<?> redirectType = classLoader.loadClass("pg0.c");
+            Method showSpeedLayout = dialogType.getDeclaredMethod("w1", Long.class);
+            Method launchSpeedUp = dialogType.getDeclaredMethod("h1");
+            Method updateState = dialogType.getDeclaredMethod("E1", stateType);
+            Method succeeded = resultType.getMethod("b");
+            Method redirectAfterConnect = redirectType.getDeclaredMethod("q", String.class);
+            Field connectResult = dialogType.getDeclaredField("c0");
+            Field resultFlags = dialogType.getDeclaredField("q0");
+            Field portalFlag = dialogType.getDeclaredField("m0");
+            Field currentApp = appType.getDeclaredField("o");
+            Field available = stateType.getField("CON_NET_AVAILABLE");
+            if (!android.app.Dialog.class.isAssignableFrom(dialogType)
+                    || !android.app.Application.class.isAssignableFrom(appType)
+                    || !stateType.isEnum()
+                    || showSpeedLayout.getReturnType() != void.class
+                    || launchSpeedUp.getReturnType() != void.class
+                    || updateState.getReturnType() != void.class
+                    || succeeded.getReturnType() != boolean.class
+                    || redirectAfterConnect.getReturnType() != boolean.class
+                    || connectResult.getType() != resultType
+                    || resultFlags.getType() != int.class || portalFlag.getType() != int.class
+                    || currentApp.getType() != appType || !Modifier.isStatic(currentApp.getModifiers())
+                    || !available.isEnumConstant()) {
+                throw new NoSuchMethodException("Unexpected post-connect signatures");
+            }
+
+            Object netAvailable = available.get(null);
+            hook(showSpeedLayout).intercept(chain -> {
+                android.app.Dialog dialog = (android.app.Dialog) chain.getThisObject();
+                if (!supportsPostConnectPromotions(dialog.getContext())
+                        || !isPostConnectSuccess(dialog, connectResult, succeeded, resultFlags, portalFlag)) {
+                    return chain.proceed();
+                }
+                if (dialog.isShowing()) {
+                    updateState.invoke(dialog, netAvailable);
+                    dialog.dismiss();
+                }
+                log(4, TAG, "Skipped automatic WiFi speed-up");
+                return null;
+            });
+            // 有些引导关闭后会直接调用 h1，不经过 w1 的动画。
+            hook(launchSpeedUp).intercept(chain -> {
+                android.app.Dialog dialog = (android.app.Dialog) chain.getThisObject();
+                if (supportsPostConnectPromotions(dialog.getContext())
+                        && isPostConnectSuccess(dialog, connectResult, succeeded, resultFlags, portalFlag)) {
+                    return null;
+                }
+                return chain.proceed();
+            });
+            // 连接页与加速结果回调共用这个推广入口，不拦截一般页面跳转。
+            hook(redirectAfterConnect).intercept(chain -> {
+                Context app = (Context) currentApp.get(null);
+                if (app != null && supportsPostConnectPromotions(app)) {
+                    log(4, TAG, "Skipped WiFi post-connect promotion");
+                    return false;
+                }
+                return chain.proceed();
+            });
+            log(4, TAG, "Hooked WiFi post-connect promotions");
+        } catch (ReflectiveOperationException e) {
+            log(5, TAG, "Post-connect hooks not installed: " + e.getMessage());
+        }
+    }
+
+    private boolean supportsPostConnectPromotions(Context context) {
+        try {
+            return context.getPackageManager().getPackageInfo(TARGET_PACKAGE, 0)
+                    .getLongVersionCode() == 261104;
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            return false;
+        }
+    }
+
+    private boolean isPostConnectSuccess(Object dialog, Field result, Method succeeded,
+            Field resultFlags, Field portalFlag) throws ReflectiveOperationException {
+        int flag = portalFlag.getInt(dialog);
+        if (flag != 4 || (resultFlags.getInt(dialog) & flag) != 0) return false;
+        Object connection = result.get(dialog);
+        return connection != null && Boolean.TRUE.equals(succeeded.invoke(connection));
+    }
+
+    /** 5.2.52 原生连接弹窗：仅收起顶部推广，不隐藏共用容器或蓝牙提示。 */
+    private void hookConnectDialogBanner(ClassLoader classLoader) {
+        try {
+            Class<?> type = classLoader.loadClass("com.wifitutu.ui.dialog.ConnectDialog");
+            Method create = type.getDeclaredMethod("onCreate", android.os.Bundle.class);
+            Method applyVipSkin = type.getDeclaredMethod("o1");
+            Method openVipPromotion = type.getDeclaredMethod("E0");
+            if (!android.app.Dialog.class.isAssignableFrom(type)
+                    || create.getReturnType() != void.class
+                    || applyVipSkin.getReturnType() != void.class
+                    || openVipPromotion.getReturnType() != boolean.class) {
+                throw new NoSuchMethodException("Unexpected connect dialog signatures");
+            }
+
+            hook(applyVipSkin).intercept(chain -> {
+                android.app.Dialog dialog = (android.app.Dialog) chain.getThisObject();
+                if (shouldHideConnectDialogBanner(dialog)) return null;
+                return chain.proceed();
+            });
+            hook(openVipPromotion).intercept(chain -> {
+                android.app.Dialog dialog = (android.app.Dialog) chain.getThisObject();
+                if (shouldHideConnectDialogBanner(dialog)) return false;
+                return chain.proceed();
+            });
+            hook(create).intercept(chain -> {
+                Object result = chain.proceed();
+                android.app.Dialog dialog = (android.app.Dialog) chain.getThisObject();
+                if (!shouldHideConnectDialogBanner(dialog)) return result;
+
+                android.content.res.Resources res = dialog.getContext().getResources();
+                int bannerId = res.getIdentifier("connect_bg", "id", TARGET_PACKAGE);
+                int containerId = res.getIdentifier("ad_layout", "id", TARGET_PACKAGE);
+                if (bannerId == 0 || containerId == 0) return result;
+                View banner = dialog.findViewById(bannerId);
+                View container = dialog.findViewById(containerId);
+                // ad_layout 也承载自动切网提示，不能隐藏整个 FrameLayout。
+                if (banner instanceof android.widget.ImageView && container != null
+                        && banner.getParent() == container && !"askBleSwitch".equals(banner.getTag())) {
+                    banner.setOnClickListener(null);
+                    banner.setClickable(false);
+                    banner.setVisibility(View.GONE);
+                    log(4, TAG, "Hidden WiFi connect dialog banner");
+                }
+                return result;
+            });
+            log(4, TAG, "Hooked WiFi connect dialog banner");
+        } catch (ReflectiveOperationException e) {
+            log(5, TAG, "Connect dialog banner hooks not installed: " + e.getMessage());
+        }
+    }
+
+    private boolean shouldHideConnectDialogBanner(android.app.Dialog dialog) {
+        return isFeatureEnabled("remove_ads", false)
+                && supportsPostConnectPromotions(dialog.getContext());
+    }
+
     private void hookAds(ClassLoader classLoader) {
+        hookConnectDialogBanner(classLoader);
         try {
             Class<?> launcherClass = classLoader.loadClass("com.wifitutu.ui.launcher.LauncherActivity");
             Method loadSplashAd = launcherClass.getDeclaredMethod("S0", int.class, int.class, boolean.class);
@@ -1696,6 +1850,63 @@ public class MainHook extends XposedModule {
                 }
             }
         } catch (Exception ignored) {}
+    }
+
+    /** 隐藏首页加速推广，保留复用同一控件的认证和网络状态提示。 */
+    private void hookHomeSpeedUpBadge(ClassLoader classLoader) {
+        try {
+            Class<?> home = classLoader.loadClass("com.wifitutu.ui.home.HomeDialog");
+            Class<?> bindingType = classLoader.loadClass("com.wifitutu.databinding.DialogHomeBinding");
+            Method render = home.getDeclaredMethod("l2");
+            Field binding = home.getDeclaredField("g");
+            Field currentAction = bindingType.getField("currentAction");
+            if (render.getReturnType() != void.class || binding.getType() != bindingType
+                    || currentAction.getType() != TextView.class) {
+                throw new NoSuchMethodException("Unexpected home action binding");
+            }
+            hook(render).intercept(chain -> {
+                Object result = chain.proceed();
+                Object bound = binding.get(chain.getThisObject());
+                TextView action = bound != null ? (TextView) currentAction.get(bound) : null;
+                if (action != null && "该WiFi可加速".contentEquals(action.getText())
+                        && supportsPostConnectPromotions(action.getContext())
+                        && action.getVisibility() != View.GONE) {
+                    action.setVisibility(View.GONE);
+                    log(4, TAG, "Hidden WiFi acceleration badge");
+                }
+                return result;
+            });
+            log(4, TAG, "Hooked WiFi acceleration badge");
+        } catch (ReflectiveOperationException e) {
+            log(5, TAG, "WiFi acceleration badge hook not installed: " + e.getMessage());
+        }
+    }
+
+    /** XML 绑定需要保留控件实例；跳过此实例刷新，不读取历史、不绑定推广列表。 */
+    private void hookMineRecentApps(ClassLoader classLoader) {
+        try {
+            Class<?> recent = classLoader.loadClass("com.wifitutu.ui.liteapp.view.RecentUsedAppView");
+            Method refresh = recent.getDeclaredMethod("refresh");
+            if (!View.class.isAssignableFrom(recent) || refresh.getReturnType() != void.class) {
+                throw new NoSuchMethodException("Unexpected recent apps refresh");
+            }
+            hook(refresh).intercept(chain -> {
+                View view = (View) chain.getThisObject();
+                Context context = view.getContext();
+                int mineId = context.getResources().getIdentifier("recent_used_view", "id", TARGET_PACKAGE);
+                if (mineId == 0 || view.getId() != mineId || !supportsPostConnectPromotions(context)) {
+                    return chain.proceed();
+                }
+                if (view.getVisibility() != View.GONE) {
+                    view.setVisibility(View.GONE);
+                    log(4, TAG, "Skipped Mine recent apps refresh");
+                }
+                return null;
+            });
+            log(4, TAG, "Hooked Mine recent apps refresh");
+        } catch (ReflectiveOperationException e) {
+            log(5, TAG, "Mine recent apps hook not installed: " + e.getMessage());
+        }
     }
 
     private void hookMeFragment(ClassLoader classLoader) {
@@ -2230,6 +2441,138 @@ public class MainHook extends XposedModule {
      * 旧版只挂了 showBubbleIfOrNot / fetchData，这两个在 5.2.52 都不是实际执行路径 (后者根本不存在)，
      * 所以气泡依旧会出现。
      */
+    /**
+     * 5.2.52（261104，pg0.c 变体）：ca0.l.i() 将广告气泡交给首页生命周期注册器。
+     * 拦截注册可避免创建组件实例；旧布局直接创建的气泡仍走原有屏蔽逻辑。
+     */
+    private void hookOptionalHomeModules(ClassLoader classLoader) {
+        if (!TARGET_PACKAGE.equals(android.app.Application.getProcessName())) return;
+        try {
+            Class<?> registryType = classLoader.loadClass("an0.q");
+            Class<?> registryInterface = classLoader.loadClass("ml0.g");
+            Class<?> lifecycleType = classLoader.loadClass("ml0.f");
+            Class<?> bubbleModule = classLoader.loadClass("ug0.a");
+            Class<?> filmModule = classLoader.loadClass("ug0.d");
+            Class<?> appType = classLoader.loadClass("com.wifitutu.ui.launcher.TuTuApp");
+            Method register = registryType.getDeclaredMethod("a", Class.class);
+            Field currentApp = appType.getDeclaredField("o");
+            if (!registryInterface.isAssignableFrom(registryType)
+                    || !lifecycleType.isAssignableFrom(bubbleModule)
+                    || !lifecycleType.isAssignableFrom(filmModule)
+                    || !android.app.Application.class.isAssignableFrom(appType)
+                    || register.getReturnType() != boolean.class || Modifier.isStatic(register.getModifiers())
+                    || currentApp.getType() != appType || !Modifier.isStatic(currentApp.getModifiers())) {
+                throw new NoSuchMethodException("Unexpected home module registration signatures");
+            }
+
+            hook(register).intercept(chain -> {
+                Object component = chain.getArgs().get(0);
+                boolean blockBubble = component == bubbleModule && isAdBubbleBlocked();
+                boolean blockFilm = component == filmModule && isOptionalHomeTabBlocked("film");
+                if (blockBubble || blockFilm) {
+                    Context app = (Context) currentApp.get(null);
+                    if (app != null && supportsPostConnectPromotions(app)) {
+                        log(4, TAG, blockBubble ? "Skipped registration of home ad bubble module"
+                                : "Skipped registration of home film module");
+                        return false;
+                    }
+                }
+                return chain.proceed();
+            });
+            log(4, TAG, "Hooked optional home module registration");
+        } catch (ReflectiveOperationException e) {
+            log(5, TAG, "Optional home module hook not installed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 5.2.52 首页：过滤已隐藏的非核心页签，避免配置入表和页面按需创建。
+     * 不触碰连接、认证、安全、消息和模块设置入口，也不禁用共享 SDK。
+     */
+    private void hookOptionalHomeTabs(ClassLoader classLoader) {
+        if (!TARGET_PACKAGE.equals(android.app.Application.getProcessName())) return;
+        try {
+            Class<?> configRegistry = classLoader.loadClass("an0.j");
+            Class<?> tabLayout = classLoader.loadClass("com.wifitutu.widget.maintab.HomeTabLayout");
+            Class<?> tabLayoutInterface = classLoader.loadClass("ml0.j");
+            Class<?> tabItem = classLoader.loadClass("ml0.i");
+            Class<?> appType = classLoader.loadClass("com.wifitutu.ui.launcher.TuTuApp");
+            Field currentApp = appType.getDeclaredField("o");
+            Method getId = tabItem.getMethod("getId");
+            Method registerDynamic = configRegistry.getDeclaredMethod("a0", List.class);
+            Method registerOverrides = configRegistry.getDeclaredMethod("c0", List.class);
+            Method setTabs = tabLayout.getDeclaredMethod("setTabs", List.class, android.os.Bundle.class);
+            if (!tabLayoutInterface.isAssignableFrom(tabLayout)
+                    || !tabItem.isInterface() || getId.getReturnType() != String.class
+                    || !android.app.Application.class.isAssignableFrom(appType)
+                    || currentApp.getType() != appType || !Modifier.isStatic(currentApp.getModifiers())) {
+                throw new NoSuchMethodException("Unexpected home tab types");
+            }
+            Method[] methods = {registerDynamic, registerOverrides, setTabs};
+            for (Method method : methods) {
+                if (method.getReturnType() != void.class || Modifier.isStatic(method.getModifiers())) {
+                    throw new NoSuchMethodException("Unexpected home tab registration signature");
+                }
+            }
+            for (Method method : methods) {
+                hook(method).intercept(chain -> {
+                    Object arg = chain.getArgs().get(0);
+                    if (arg instanceof List<?> && !((List<?>) arg).isEmpty()) {
+                        Context app = (Context) currentApp.get(null);
+                        if (app != null && supportsPostConnectPromotions(app)) {
+                            List<?> original = (List<?>) arg;
+                            List<?> filtered = filterOptionalHomeTabs(original, tabItem, getId);
+                            if (filtered != original) {
+                                Object[] args = chain.getArgs().toArray();
+                                args[0] = filtered;
+                                log(4, TAG, "Filtered optional home tabs before registration: "
+                                        + (original.size() - filtered.size()));
+                                return chain.proceed(args);
+                            }
+                        }
+                    }
+                    return chain.proceed();
+                });
+            }
+            log(4, TAG, "Hooked optional home tab configuration");
+        } catch (ReflectiveOperationException e) {
+            log(5, TAG, "Optional home tab hooks not installed: " + e.getMessage());
+        }
+    }
+
+    private List<?> filterOptionalHomeTabs(List<?> original, Class<?> tabItem, Method getId)
+            throws ReflectiveOperationException {
+        List<Object> filtered = null;
+        for (int i = 0; i < original.size(); i++) {
+            Object item = original.get(i);
+            String id = tabItem.isInstance(item) ? (String) getId.invoke(item) : null;
+            if (isOptionalHomeTabBlocked(id)) {
+                if (filtered == null) filtered = new ArrayList<>(original.subList(0, i));
+            } else if (filtered != null) {
+                filtered.add(item);
+            }
+        }
+        return filtered == null ? original : filtered;
+    }
+
+    private boolean isOptionalHomeTabBlocked(String id) {
+        if (id == null) return false;
+        switch (id) {
+            case "movie":
+            case "film":
+            case "nearby":
+            case "welfare":
+            case "deepseek":
+            case "shopmall":
+            case "bus":
+            case "kouxin":
+            case "game":
+                return isFeatureEnabled(mapTabIdToPrefKey(id), false);
+            default:
+                return false;
+        }
+    }
+
     private void hookFloatingBall(ClassLoader classLoader) {
         String[] classes = {
             "com.wifitutu.ui.bubble.BubbleView",

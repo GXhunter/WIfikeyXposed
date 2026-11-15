@@ -1,0 +1,219 @@
+name: Release
+
+# 推送版本 tag 后构建并上传到 Release 草稿。
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 构建签名 APK 并发布
+    if: github.repository == 'GXhunter/WIfikeyXposed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: 校验 tag 与 versionName 一致
+        id: ver
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::tag '$TAG' 不符合 vX.Y.Z 格式"
+            exit 1
+          fi
+          VERSION="${BASH_REMATCH[1]}"
+          NAME="$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -n1)"
+          CODE="$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts | head -n1)"
+          echo "解析结果: tag=$TAG versionName=$NAME versionCode=$CODE"
+          if [[ "$NAME" != "$VERSION" ]]; then
+            echo "::error::tag $TAG 与 app/build.gradle.kts 的 versionName（$NAME）不一致，请先改版本号再打 tag"
+            exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "version_code=$CODE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: 配置 Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 安装 Android SDK 平台
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          export ANDROID_HOME="$SDK_ROOT"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          SDKM="$(command -v sdkmanager || true)"
+          if [[ -z "$SDKM" ]]; then
+            SDKM="$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n1 || true)"
+          fi
+          if [[ -z "$SDKM" ]]; then
+            echo "::error::找不到 sdkmanager，检查 runner 的 Android SDK 安装"
+            exit 1
+          fi
+          echo "sdkmanager: $SDKM"
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          # 本项目 compileSdk = 37，CI 上对应的包名是 platforms;android-37.0
+          "$SDKM" --install "platform-tools" "platforms;android-37.0"
+          # 部分 AGP 版本按 android-37 查找，补一个软链兜底
+          if [[ -d "$SDK_ROOT/platforms/android-37.0" && ! -e "$SDK_ROOT/platforms/android-37" ]]; then
+            ln -s android-37.0 "$SDK_ROOT/platforms/android-37"
+          fi
+          ls -1 "$SDK_ROOT/platforms"
+
+      - name: 去掉本机 SOCKS 代理配置
+        shell: bash
+        # gradle.properties 里写死了 127.0.0.1:10808，runner 上没有这个代理，必须移除
+        run: |
+          set -euo pipefail
+          sed -i '/^[[:space:]]*systemProp\./d' gradle.properties
+          cat gradle.properties
+
+      - name: 恢复签名密钥
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [[ -z "${!v:-}" ]]; then
+              echo "::error::缺少仓库 secret：$v"
+              missing=1
+            fi
+          done
+          [[ $missing -eq 0 ]] || exit 1
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > app/wifikeyxposed.keystore
+          test -s app/wifikeyxposed.keystore
+          property() {
+            local value="$2"
+            value="${value//\\/\\\\}"
+            value="${value// /\\ }"
+            value="${value//$'\t'/\\t}"
+            value="${value//$'\r'/\\r}"
+            value="${value//$'\n'/\\n}"
+            printf '%s=%s\n' "$1" "$value"
+          }
+          {
+            property storeFile wifikeyxposed.keystore
+            property storePassword "$KEYSTORE_PASSWORD"
+            property keyAlias "$KEY_ALIAS"
+            property keyPassword "$KEY_PASSWORD"
+          } > app/keystore.properties
+          echo "签名材料已就绪"
+
+      - name: 构建 Release APK
+        shell: bash
+        run: ./gradlew :app:assembleRelease --stacktrace
+
+      - name: 整理产物并校验签名
+        id: artifact
+        shell: bash
+        env:
+          EXPECTED_CERT_SHA256: ${{ vars.RELEASE_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SRC="app/build/outputs/apk/release/app-release.apk"
+          if [[ ! -f "$SRC" ]]; then
+            echo "::error::未找到已签名产物 $SRC"
+            ls -R app/build/outputs/apk || true
+            exit 1
+          fi
+          OUT="WIfikeyXposed-v${{ steps.ver.outputs.version }}.apk"
+          cp "$SRC" "$OUT"
+          APKSIGNER="$(ls "$SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n1 || true)"
+          if [[ -z "$APKSIGNER" ]]; then
+            echo "::error::找不到 apksigner，检查 build-tools 是否安装"
+            exit 1
+          fi
+          echo "apksigner: $APKSIGNER"
+          EXPECTED="$(printf '%s' "$EXPECTED_CERT_SHA256" | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          if [[ ! "$EXPECTED" =~ ^[0-9A-F]{64}$ ]]; then
+            echo "::error::请配置仓库变量 RELEASE_CERT_SHA256（fork 签名证书指纹）"
+            exit 1
+          fi
+          CERTS="$("$APKSIGNER" verify --print-certs "$OUT")"
+          ACTUAL="$(printf '%s\n' "$CERTS" | awk '/^Signer #[0-9]+ certificate SHA-256 digest: / { print toupper($NF) }')"
+          if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+            echo "::error::APK 签名证书与 fork 的预期指纹不一致"
+            exit 1
+          fi
+          sha256sum "$OUT" > "$OUT.sha256"
+          ls -lh "$OUT"
+          {
+            echo "apk=$OUT"
+            echo "sha=$OUT.sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 生成 Release 说明
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION_CODE: ${{ steps.ver.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          awk -v v="### v$VERSION" '{sub(/\r$/, "")} $0==v{f=1;next} f&&/^(#|##|###) /{exit} f' README.md > notes.md
+          sed -i -e 's/[[:space:]]*$//' notes.md
+          if [[ ! -s notes.md ]]; then
+            printf -- '- 版本号：%s\n- versionCode：%s\n' "$VERSION" "$VERSION_CODE" > notes.md
+          fi
+          {
+            echo "**适用目标**：WiFi万能钥匙（详见 README 兼容说明）"
+            echo
+            cat notes.md
+            echo
+            echo '---'
+            echo
+            echo "**安装包**：\`WIfikeyXposed-v${VERSION}.apk\`（已签名，minSdk 30 / Android 11+）"
+            if [[ -f "WIfikeyXposed-v${VERSION}.apk.sha256" ]]; then
+              echo
+              echo '```'
+              cat "WIfikeyXposed-v${VERSION}.apk.sha256"
+              echo '```'
+            fi
+          } > release_notes.md
+          cat release_notes.md
+
+      - name: 上传到 GitHub Release 草稿
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          body_path: release_notes.md
+          files: |
+            ${{ steps.artifact.outputs.apk }}
+            ${{ steps.artifact.outputs.sha }}
+          fail_on_unmatched_files: true
+          draft: true
+          prerelease: false

@@ -5,6 +5,10 @@
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <permission
+        android:name="com.ty.wifikeyxposed.permission.SEND_HOST_COMMAND"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.ty.wifikeyxposed.permission.SEND_HOST_COMMAND" />
 
     <application
         android:name=".ModuleApp"

@@ -2,8 +2,8 @@
 
 WiFi万能钥匙 5.2.29 的 Xposed 模块，提供本地 SVIP 永久解锁、全模块去广告、底栏/工具栏精简、WiFi 防护等功能。
 
-[![Latest Release](https://img.shields.io/badge/最新版本-v1.6.0-blue)](https://github.com/TYOPXN360/WIfikeyXposed/releases/latest)
-[![Downloads](https://img.shields.io/badge/平台-Android_11%2B-green)](https://github.com/TYOPXN360/WIfikeyXposed/releases)
+[![Latest Release](https://img.shields.io/github/v/release/GXhunter/WIfikeyXposed?label=Release)](https://github.com/GXhunter/WIfikeyXposed/releases/latest)
+[![Android 11+](https://img.shields.io/badge/平台-Android_11%2B-green)](https://github.com/GXhunter/WIfikeyXposed/releases)
 
 ## ⚠️ 代码生成说明
 
@@ -59,13 +59,13 @@ WiFi万能钥匙 5.2.29 的 Xposed 模块，提供本地 SVIP 永久解锁、全
 
 - **目标应用**：WiFi万能钥匙 5.2.29 (com.snda.wifilocating)
 - **最低系统**：Android 11 (API 30)
-- **Xposed API**：libxposed API 101
+- **最低 Xposed API**：libxposed API 102
 - **开发框架**：Android Gradle + Kotlin + Jetpack Compose
 - **UI 设计**：Material 3 Dynamic Color
 
 ## 安装说明
 
-1. 从 [Releases](https://github.com/TYOPXN360/WIfikeyXposed/releases/latest) 下载最新 APK
+1. 从 [本 fork 的 Releases](https://github.com/GXhunter/WIfikeyXposed/releases/latest) 下载最新 APK。此 fork 使用独立签名；若已安装同包名的上游版本，Android 通常不允许直接覆盖，请先备份模块配置再卸载旧版。
 2. 确保设备已安装 LSPosed 框架
 3. 安装 APK 并在 LSPosed 管理器中激活本模块
 4. 勾选目标应用（WiFi万能钥匙）
@@ -96,6 +96,15 @@ WIfikeyXposed/
 - WiFi 防护功能为实验性功能，可能不完全生效
 
 ## 更新日志
+
+### v1.0.0
+
+- 本 fork 的首个独立发行版本，从 `v1.0.0` 开始编号，使用独立签名和下载入口。
+- 包含连接成功页与连接弹窗的推广展示调整，以及首页和「我的」页的可选内容精简。
+
+## 上游更新记录
+
+以下版本号属于上游项目，不计入本 fork 的发布版本。
 
 ### v1.6.1
 - 连接页净化：随「去除内置广告」隐藏顶部连接状态卡片及底部地图推广整行，关闭开关后返回首页恢复；同步刷新布局，不保留空白占位（适配 5.2.52 / 261104）。

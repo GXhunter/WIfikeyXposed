@@ -57,6 +57,10 @@ WiFi万能钥匙 5.2.29 的 Xposed 模块，提供本地 SVIP 永久解锁、全
 
 ## 技术信息
 
+新版适配使用 [DexKit](https://github.com/LuckyPray/DexKit) 根据方法签名、业务字符串和调用关系定位混淆入口。缓存与宿主 APK 的 SHA-256 和规则版本绑定。无匹配或有歧义时，对应 Hook 保留宿主原行为，并在 LSPosed 日志记录原因。
+
+定位规则已在 5.2.52（261104）与 5.2.55（261116）的真实 APK 上验证。当前覆盖单一 base APK，分包和动态 DEX 需要独立核对。升级模块后建议冷启动目标应用，以加载本代 DexKit 原生库。
+
 - **目标应用**：WiFi万能钥匙 5.2.29 (com.snda.wifilocating)
 - **最低系统**：Android 11 (API 30)
 - **最低 Xposed API**：libxposed API 102
